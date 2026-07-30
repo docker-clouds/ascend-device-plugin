@@ -60,6 +60,7 @@ type AscendManager struct {
 	globalConfig internal.Config
 	devs         []*Device
 	nodeConfig   *internal.NodeConfig
+	podLister    *PodLister
 }
 
 func NewAscendManager() (*AscendManager, error) {
@@ -71,6 +72,12 @@ func NewAscendManager() (*AscendManager, error) {
 		mgr:  mgr,
 		devs: []*Device{},
 	}, nil
+}
+
+// SetPodLister attaches a PodLister so that CleanupIdleVNPUs can make
+// pod-aware decisions. When not set, cleanup is skipped for safety.
+func (am *AscendManager) SetPodLister(pl *PodLister) {
+	am.podLister = pl
 }
 
 func (am *AscendManager) LoadNodeConfig(nodePath string, nodeName string) error {
@@ -304,6 +311,31 @@ func (am *AscendManager) GetUnHealthIDs() []int32 {
 func (am *AscendManager) CleanupIdleVNPUs() error {
 	klog.Info("Starting cleanup of idle vNPUs...")
 
+	// Pod-aware gate: only proceed when we can verify pod state.
+	// If the PodLister is unavailable or not synced, skip cleanup entirely
+	// as a safe default to avoid destroying vnpus still needed by running pods.
+	if am.podLister == nil {
+		klog.Warning("PodLister not set; skipping vnpu cleanup for safety")
+		return nil
+	}
+	if !am.podLister.IsSynced() {
+		klog.Warning("PodLister not synced yet; skipping vnpu cleanup for safety")
+		return nil
+	}
+
+	if err := am.UpdateDevice(); err != nil {
+		klog.Warningf("Failed to refresh device list before cleanup: %v", err)
+		return nil
+	}
+
+	annoKey := fmt.Sprintf("huawei.com/%s", am.config.CommonWord)
+	activeKeys := am.podLister.ActiveVnpuKeys(annoKey, am.GetDeviceByUUID)
+	if activeKeys == nil {
+		klog.Warning("Failed to build active vnpu keys (pod list error); skipping vnpu cleanup for safety")
+		return nil
+	}
+	klog.Infof("Found %d active vnpu key(s) from non-terminal pods", len(activeKeys))
+
 	_, IDs, err := am.mgr.GetDeviceList()
 	if err != nil {
 		return fmt.Errorf("failed to get device list: %w", err)
@@ -311,6 +343,7 @@ func (am *AscendManager) CleanupIdleVNPUs() error {
 	klog.Infof("Found %d devices to check for idle vNPUs,%+v", len(IDs), IDs)
 
 	totalCleaned := 0
+	totalSkipped := 0
 	for _, logicID := range IDs {
 		cardID, deviceID, err := am.mgr.GetCardIDDeviceID(logicID)
 		if err != nil {
@@ -342,6 +375,14 @@ func (am *AscendManager) CleanupIdleVNPUs() error {
 			klog.V(1).Infof("vNPU CardId=%d, VDevID(Vnpu ID)=%d,template=%s,IsContainerUsed=%d", cardID, vDev.VDevID, vDev.QueryInfo.Name, vDev.QueryInfo.IsContainerUsed)
 
 			if vDev.QueryInfo.IsContainerUsed == 0 {
+				key := VnpuKey{LogicID: logicID, Template: vDev.QueryInfo.Name}
+				if activeKeys[key] {
+					klog.Infof("Skipping idle vnpu (non-terminal pod active): logicID=%d, vnpuID=%d, template=%s",
+						logicID, vDev.VDevID, vDev.QueryInfo.Name)
+					totalSkipped++
+					continue
+				}
+
 				klog.V(1).Infof("Found idle vNPU: cardID=%d, deviceID=%d, vnpuID=%d, status=%d, template=%s,IsContainerUsed=%d",
 					cardID, deviceID, vDev.VDevID, vDev.QueryInfo.Status, vDev.QueryInfo.Name, vDev.QueryInfo.IsContainerUsed)
 
@@ -359,7 +400,7 @@ func (am *AscendManager) CleanupIdleVNPUs() error {
 		}
 	}
 
-	klog.Infof("Cleanup completed, destroyed %d idle vNPUs", totalCleaned)
+	klog.Infof("Cleanup completed, destroyed %d idle vNPUs, skipped %d (pod-active)", totalCleaned, totalSkipped)
 	return nil
 }
 

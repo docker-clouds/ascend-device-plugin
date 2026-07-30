@@ -150,6 +150,15 @@ func main() {
 	}
 	client.InitGlobalClient()
 
+	podLister, err := manager.NewPodLister(*nodeName)
+	if err != nil {
+		klog.Warningf("Failed to init pod lister for vnpu cleanup: %v", err)
+	} else {
+		mgr.SetPodLister(podLister)
+		defer podLister.Stop()
+		klog.Info("Pod lister initialized for pod-aware vnpu cleanup")
+	}
+
 	if mgr.IsHamiVnpuCore() {
 		go func() {
 			defer func() {

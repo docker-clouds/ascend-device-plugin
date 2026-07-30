@@ -1,7 +1,7 @@
 GO ?= go
 VERSION ?= unknown
 BUILDARGS ?= -ldflags '-s -w -X github.com/Project-HAMi/ascend-device-plugin/version.version=$(VERSION)'
-IMG_NAME = projecthami/ascend-device-plugin
+IMG_NAME = ghcr.io/docker-clouds/ascend-device-plugin
 
 all: ascend-device-plugin
 
