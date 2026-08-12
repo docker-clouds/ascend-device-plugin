@@ -71,6 +71,7 @@ type PluginServer struct {
 	healthCh              chan int32
 	checkIdleVNPUInterval int
 	wg                    sync.WaitGroup
+	allocMutex            sync.Mutex
 
 	// test hooks — injected by tests to avoid real socket/kubelet dependencies
 	dialFunc                 func(unixSocketPath string, timeout time.Duration) (*grpc.ClientConn, error)
@@ -290,6 +291,9 @@ func (ps *PluginServer) GetPreferredAllocation(context.Context, *v1beta1.Preferr
 }
 
 func (ps *PluginServer) Allocate(ctx context.Context, reqs *v1beta1.AllocateRequest) (*v1beta1.AllocateResponse, error) {
+	ps.allocMutex.Lock()
+	defer ps.allocMutex.Unlock()
+
 	klog.V(5).Infof("Allocate: %v", reqs)
 	success := false
 	var pod *v1.Pod
