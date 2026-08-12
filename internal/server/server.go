@@ -33,7 +33,6 @@ import (
 
 	// "github.com/Project-HAMi/HAMi/pkg/device/ascend"
 	"github.com/Project-HAMi/HAMi/pkg/device"
-	"github.com/Project-HAMi/HAMi/pkg/util"
 	"github.com/Project-HAMi/ascend-device-plugin/internal/manager"
 )
 
@@ -309,10 +308,10 @@ func (ps *PluginServer) Allocate(ctx context.Context, reqs *v1beta1.AllocateRequ
 	}()
 
 	var err error
-	pod, err = util.GetPendingPod(ctx, ps.nodeName)
+	pod, err = ps.getAllocatingPod(ctx)
 	if err != nil {
-		klog.Errorf("get pending pod error: %v", err)
-		return nil, fmt.Errorf("get pending pod error: %w", err)
+		klog.Errorf("get allocating pod error: %v", err)
+		return nil, fmt.Errorf("get allocating pod error: %w", err)
 	}
 	klog.Infof("allocating for pod %s/%s", pod.Namespace, pod.Name)
 

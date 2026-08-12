@@ -1,18 +1,21 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"strconv"
 
 	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
 	"k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
 
 	"github.com/Project-HAMi/HAMi/pkg/device"
 	"github.com/Project-HAMi/HAMi/pkg/device-plugin/nvidiadevice/nvinternal/plugin"
 	"github.com/Project-HAMi/HAMi/pkg/util"
+	"github.com/Project-HAMi/HAMi/pkg/util/client"
 )
 
 var hostHookPath string
@@ -224,4 +227,45 @@ func (ps *PluginServer) podAllocationTrySuccess(pod *v1.Pod) {
 // podAllocationFailed sets bind-phase to "failed" and releases the node lock.
 func (ps *PluginServer) podAllocationFailed(pod *v1.Pod) {
 	plugin.PodAllocationFailed(ps.nodeName, pod, NodeLockAscend)
+}
+
+// getAllocatingPod finds the pending pod on this node that is currently being
+// allocated. It first tries the nodelock fast path (GetAllocatePodByNode),
+// then falls back to listing pods with bind-phase "allocating" only.
+// Unlike util.GetPendingPod, it does NOT accept bind-phase "success", which
+// prevents already-processed pods from being returned and causing
+// "no pending device allocation found" errors.
+func (ps *PluginServer) getAllocatingPod(ctx context.Context) (*v1.Pod, error) {
+	pod, err := util.GetAllocatePodByNode(ctx, ps.nodeName)
+	if err != nil {
+		return nil, fmt.Errorf("get allocate pod by node: %w", err)
+	}
+	if pod != nil {
+		return pod, nil
+	}
+
+	selector := fmt.Sprintf("spec.nodeName=%s", ps.nodeName)
+	podlist, err := client.GetClient().CoreV1().Pods("").List(ctx, metav1.ListOptions{
+		FieldSelector: selector,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list pods on node %s: %w", ps.nodeName, err)
+	}
+	for i := range podlist.Items {
+		p := &podlist.Items[i]
+		if p.Status.Phase != v1.PodPending {
+			continue
+		}
+		if _, ok := p.Annotations[util.BindTimeAnnotations]; !ok {
+			continue
+		}
+		phase, ok := p.Annotations[util.DeviceBindPhase]
+		if !ok || phase != util.DeviceBindAllocating {
+			continue
+		}
+		if n, ok := p.Annotations[util.AssignedNodeAnnotations]; ok && n == ps.nodeName {
+			return p, nil
+		}
+	}
+	return nil, fmt.Errorf("no allocating pod found on node %s", ps.nodeName)
 }

@@ -168,7 +168,7 @@ func TestAllocate(t *testing.T) {
 					},
 				},
 			},
-			wantErr: "get pending pod",
+			wantErr: "get allocating pod",
 			setup:   func() CleanupFunc { return setupFakeClient(nil, nil) },
 		},
 		{
