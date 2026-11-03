@@ -81,7 +81,7 @@ func TestActiveVnpuKeys_RunningPodMatchingTemplate(t *testing.T) {
 	defer pl.Stop()
 
 	active := pl.ActiveVnpuKeys(testAnnoKey, makeDeviceByUUID(devs))
-	if !active[VnpuKey{LogicID: 0, Template: "vir01"}] {
+	if _, ok := active[VnpuKey{LogicID: 0, Template: "vir01"}]; !ok {
 		t.Errorf("expected key {0, vir01} to be active, got %v", active)
 	}
 }
@@ -150,10 +150,10 @@ func TestActiveVnpuKeys_DifferentTemplateNotBlocking(t *testing.T) {
 	defer pl.Stop()
 
 	active := pl.ActiveVnpuKeys(testAnnoKey, makeDeviceByUUID(devs))
-	if active[VnpuKey{LogicID: 0, Template: "vir02"}] {
+	if _, ok := active[VnpuKey{LogicID: 0, Template: "vir02"}]; ok {
 		t.Errorf("did not expect key {0, vir02} to be active, got %v", active)
 	}
-	if !active[VnpuKey{LogicID: 0, Template: "vir01"}] {
+	if _, ok := active[VnpuKey{LogicID: 0, Template: "vir01"}]; !ok {
 		t.Errorf("expected key {0, vir01} to be active, got %v", active)
 	}
 }
@@ -177,10 +177,10 @@ func TestActiveVnpuKeys_DifferentDeviceNotBlocking(t *testing.T) {
 	defer pl.Stop()
 
 	active := pl.ActiveVnpuKeys(testAnnoKey, makeDeviceByUUID(devs))
-	if active[VnpuKey{LogicID: 1, Template: "vir01"}] {
+	if _, ok := active[VnpuKey{LogicID: 1, Template: "vir01"}]; ok {
 		t.Errorf("did not expect key {1, vir01} to be active, got %v", active)
 	}
-	if !active[VnpuKey{LogicID: 0, Template: "vir01"}] {
+	if _, ok := active[VnpuKey{LogicID: 0, Template: "vir01"}]; !ok {
 		t.Errorf("expected key {0, vir01} to be active, got %v", active)
 	}
 }
@@ -240,10 +240,157 @@ func TestActiveVnpuKeys_MultiplePodsMixedPhases(t *testing.T) {
 	defer pl.Stop()
 
 	active := pl.ActiveVnpuKeys(testAnnoKey, makeDeviceByUUID(devs))
-	if !active[VnpuKey{LogicID: 0, Template: "vir01"}] {
+	if _, ok := active[VnpuKey{LogicID: 0, Template: "vir01"}]; !ok {
 		t.Errorf("expected key {0, vir01} from running pod to be active, got %v", active)
 	}
-	if active[VnpuKey{LogicID: 1, Template: "vir02"}] {
+	if _, ok := active[VnpuKey{LogicID: 1, Template: "vir02"}]; ok {
 		t.Errorf("did not expect key {1, vir02} from succeeded pod to be active, got %v", active)
+	}
+}
+
+// makeStatusfulPod builds a pod on node1 with the given container statuses and
+// vnpu annotation claiming (uuid-0, vir01).
+func makeStatusfulPod(name string, phase corev1.PodPhase, statuses []corev1.ContainerStatus) *corev1.Pod {
+	pod := makePod(name, "default", "node1", phase, testAnnoKey, makeAnnotation([]vnpuAnnotationInfo{
+		{UUID: "uuid-0", Temp: "vir01"},
+	}))
+	pod.Status.ContainerStatuses = statuses
+	return pod
+}
+
+func waitingStatus(reason string) corev1.ContainerStatus {
+	return corev1.ContainerStatus{
+		Name:  "main",
+		State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: reason}},
+	}
+}
+
+func runningStatus() corev1.ContainerStatus {
+	return corev1.ContainerStatus{
+		Name:  "main",
+		State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+	}
+}
+
+func terminatedStatus() corev1.ContainerStatus {
+	return corev1.ContainerStatus{
+		Name:  "main",
+		State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{Reason: "Error", ExitCode: 1}},
+	}
+}
+
+func TestActiveVnpuKeys_CrashLoopPodExcluded(t *testing.T) {
+	devs := []*Device{{UUID: "uuid-0", LogicID: 0}}
+	fakeClient := fake.NewSimpleClientset(
+		makeStatusfulPod("pod-zombie", corev1.PodRunning,
+			[]corev1.ContainerStatus{waitingStatus("CrashLoopBackOff")}),
+	)
+
+	pl, err := newPodLister("node1", fakeClient)
+	if err != nil {
+		t.Fatalf("newPodLister: %v", err)
+	}
+	defer pl.Stop()
+
+	active := pl.ActiveVnpuKeys(testAnnoKey, makeDeviceByUUID(devs))
+	if len(active) != 0 {
+		t.Errorf("expected no active keys for crash-looping pod, got %v", active)
+	}
+}
+
+func TestActiveVnpuKeys_AllTerminatedPodExcluded(t *testing.T) {
+	devs := []*Device{{UUID: "uuid-0", LogicID: 0}}
+	fakeClient := fake.NewSimpleClientset(
+		makeStatusfulPod("pod-exited", corev1.PodRunning,
+			[]corev1.ContainerStatus{terminatedStatus()}),
+	)
+
+	pl, err := newPodLister("node1", fakeClient)
+	if err != nil {
+		t.Fatalf("newPodLister: %v", err)
+	}
+	defer pl.Stop()
+
+	active := pl.ActiveVnpuKeys(testAnnoKey, makeDeviceByUUID(devs))
+	if len(active) != 0 {
+		t.Errorf("expected no active keys for all-terminated pod, got %v", active)
+	}
+}
+
+func TestActiveVnpuKeys_ContainerCreatingProtected(t *testing.T) {
+	devs := []*Device{{UUID: "uuid-0", LogicID: 0}}
+	fakeClient := fake.NewSimpleClientset(
+		makeStatusfulPod("pod-starting", corev1.PodRunning,
+			[]corev1.ContainerStatus{waitingStatus("ContainerCreating")}),
+	)
+
+	pl, err := newPodLister("node1", fakeClient)
+	if err != nil {
+		t.Fatalf("newPodLister: %v", err)
+	}
+	defer pl.Stop()
+
+	active := pl.ActiveVnpuKeys(testAnnoKey, makeDeviceByUUID(devs))
+	if _, ok := active[VnpuKey{LogicID: 0, Template: "vir01"}]; !ok {
+		t.Errorf("expected key {0, vir01} for ContainerCreating pod, got %v", active)
+	}
+}
+
+func TestActiveVnpuKeys_ImagePullBackOffProtected(t *testing.T) {
+	devs := []*Device{{UUID: "uuid-0", LogicID: 0}}
+	fakeClient := fake.NewSimpleClientset(
+		makeStatusfulPod("pod-pulling", corev1.PodRunning,
+			[]corev1.ContainerStatus{waitingStatus("ImagePullBackOff")}),
+	)
+
+	pl, err := newPodLister("node1", fakeClient)
+	if err != nil {
+		t.Fatalf("newPodLister: %v", err)
+	}
+	defer pl.Stop()
+
+	active := pl.ActiveVnpuKeys(testAnnoKey, makeDeviceByUUID(devs))
+	if _, ok := active[VnpuKey{LogicID: 0, Template: "vir01"}]; !ok {
+		t.Errorf("expected key {0, vir01} for ImagePullBackOff pod, got %v", active)
+	}
+}
+
+func TestActiveVnpuKeys_MixedCrashLoopAndRunningProtected(t *testing.T) {
+	devs := []*Device{{UUID: "uuid-0", LogicID: 0}}
+	fakeClient := fake.NewSimpleClientset(
+		makeStatusfulPod("pod-mixed", corev1.PodRunning,
+			[]corev1.ContainerStatus{waitingStatus("CrashLoopBackOff"), runningStatus()}),
+	)
+
+	pl, err := newPodLister("node1", fakeClient)
+	if err != nil {
+		t.Fatalf("newPodLister: %v", err)
+	}
+	defer pl.Stop()
+
+	active := pl.ActiveVnpuKeys(testAnnoKey, makeDeviceByUUID(devs))
+	if _, ok := active[VnpuKey{LogicID: 0, Template: "vir01"}]; !ok {
+		t.Errorf("expected key {0, vir01} for mixed pod with a running container, got %v", active)
+	}
+}
+
+func TestActiveVnpuKeys_PendingNoStatusesProtected(t *testing.T) {
+	devs := []*Device{{UUID: "uuid-0", LogicID: 0}}
+	fakeClient := fake.NewSimpleClientset(
+		makePod("pod-fresh", "default", "node1", corev1.PodPending,
+			testAnnoKey, makeAnnotation([]vnpuAnnotationInfo{
+				{UUID: "uuid-0", Temp: "vir01"},
+			})),
+	)
+
+	pl, err := newPodLister("node1", fakeClient)
+	if err != nil {
+		t.Fatalf("newPodLister: %v", err)
+	}
+	defer pl.Stop()
+
+	active := pl.ActiveVnpuKeys(testAnnoKey, makeDeviceByUUID(devs))
+	if _, ok := active[VnpuKey{LogicID: 0, Template: "vir01"}]; !ok {
+		t.Errorf("expected key {0, vir01} for freshly scheduled pod without container statuses, got %v", active)
 	}
 }

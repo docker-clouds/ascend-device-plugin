@@ -117,20 +117,31 @@ func (pl *PodLister) IsSynced() bool {
 	return pl.podListerSynced()
 }
 
-// ActiveVnpuKeys returns the set of (logicID, template) pairs that are
-// referenced by non-terminal pods on this node. annoKey is the pod annotation
-// key (e.g. "huawei.com/Ascend910C") and deviceByUUID resolves a device UUID
-// to its Device so the logicID can be obtained.
-func (pl *PodLister) ActiveVnpuKeys(annoKey string, deviceByUUID func(string) *Device) map[VnpuKey]bool {
+// ActiveVnpuKeys returns the (logicID, template) pairs that are referenced by
+// pods on this node still actively using (or about to use) their vnpu slots,
+// mapped to the claiming pod names. annoKey is the pod annotation key (e.g.
+// "huawei.com/Ascend910C") and deviceByUUID resolves a device UUID to its
+// Device so the logicID can be obtained.
+//
+// Pods in a terminal phase (Succeeded/Failed) and non-terminal pods whose
+// containers are all crash-looping or terminated (zombies of failed
+// workloads) do not contribute keys, so their idle vnpus stay eligible for
+// cleanup.
+func (pl *PodLister) ActiveVnpuKeys(annoKey string, deviceByUUID func(string) *Device) map[VnpuKey][]string {
 	pods, err := pl.podLister.List(labels.Everything())
 	if err != nil {
 		klog.Warningf("PodLister: failed to list pods: %v", err)
 		return nil
 	}
 
-	active := make(map[VnpuKey]bool)
+	active := make(map[VnpuKey][]string)
 	for _, pod := range pods {
 		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		if !podActivelyUsesVnpu(pod) {
+			klog.Infof("PodLister: pod %s/%s holds vnpu annotation but all containers are in CrashLoopBackOff/terminated state; treating as zombie, not protecting slots",
+				pod.Namespace, pod.Name)
 			continue
 		}
 
@@ -155,10 +166,43 @@ func (pl *PodLister) ActiveVnpuKeys(annoKey string, deviceByUUID func(string) *D
 				continue
 			}
 			key := VnpuKey{LogicID: dev.LogicID, Template: info.Temp}
-			active[key] = true
+			active[key] = append(active[key], pod.Namespace+"/"+pod.Name)
 			klog.V(4).Infof("PodLister: active vnpu key %+v from pod %s/%s (phase=%s)",
 				key, pod.Namespace, pod.Name, pod.Status.Phase)
 		}
 	}
 	return active
+}
+
+// podActivelyUsesVnpu reports whether the pod may still make use of its
+// claimed vnpus and therefore needs its slots protected from idle cleanup.
+//
+// Protective: any container Running, waiting in a non-backoff phase
+// (ContainerCreating/PodInitializing/ImagePullBackOff/...), or no container
+// status yet (freshly scheduled pod, allocation-to-start race window).
+// Not protective: every container is either Waiting with reason
+// CrashLoopBackOff (kubelet backoff after repeated crashes) or Terminated
+// awaiting restart — the pod is a zombie whose containers get vnpus
+// re-created on demand if they ever start again.
+func podActivelyUsesVnpu(pod *corev1.Pod) bool {
+	statuses := make([]corev1.ContainerStatus, 0,
+		len(pod.Status.InitContainerStatuses)+len(pod.Status.ContainerStatuses))
+	statuses = append(statuses, pod.Status.InitContainerStatuses...)
+	statuses = append(statuses, pod.Status.ContainerStatuses...)
+	if len(statuses) == 0 {
+		return true
+	}
+	for _, cs := range statuses {
+		switch {
+		case cs.State.Running != nil:
+			return true
+		case cs.State.Terminated != nil:
+			continue
+		case cs.State.Waiting != nil && cs.State.Waiting.Reason == "CrashLoopBackOff":
+			continue
+		default:
+			return true
+		}
+	}
+	return false
 }

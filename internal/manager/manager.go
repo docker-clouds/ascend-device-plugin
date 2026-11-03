@@ -19,6 +19,7 @@ package manager
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 
 	"ascend-common/devmanager"
@@ -334,7 +335,7 @@ func (am *AscendManager) CleanupIdleVNPUs() error {
 		klog.Warning("Failed to build active vnpu keys (pod list error); skipping vnpu cleanup for safety")
 		return nil
 	}
-	klog.Infof("Found %d active vnpu key(s) from non-terminal pods", len(activeKeys))
+	klog.Infof("Found %d active vnpu key(s) from active pods (zombie/terminal pods excluded)", len(activeKeys))
 
 	_, IDs, err := am.mgr.GetDeviceList()
 	if err != nil {
@@ -376,9 +377,9 @@ func (am *AscendManager) CleanupIdleVNPUs() error {
 
 			if vDev.QueryInfo.IsContainerUsed == 0 {
 				key := VnpuKey{LogicID: logicID, Template: vDev.QueryInfo.Name}
-				if activeKeys[key] {
-					klog.Infof("Skipping idle vnpu (non-terminal pod active): logicID=%d, vnpuID=%d, template=%s",
-						logicID, vDev.VDevID, vDev.QueryInfo.Name)
+				if pods, ok := activeKeys[key]; ok {
+					klog.Infof("Skipping idle vnpu: logicID=%d, vnpuID=%d, template=%s, protected by %d pod(s): %s",
+						logicID, vDev.VDevID, vDev.QueryInfo.Name, len(pods), strings.Join(pods, ", "))
 					totalSkipped++
 					continue
 				}
