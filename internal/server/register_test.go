@@ -335,7 +335,7 @@ func TestRegisterHAMi(t *testing.T) {
 			},
 		},
 		{
-			name: "NonAscend910_NoCustomInfo",
+			name: "Ascend310P_SlotInfo_ZeroValuesOmitted",
 			args: registerHAMiArgs{
 				nodeName:      "test-node",
 				registerAnno:  "hami.io/node-register-Ascend310P",
@@ -356,8 +356,104 @@ func TestRegisterHAMi(t *testing.T) {
 				deviceCount: 1,
 				deviceCheck: func(t *testing.T, devs []*device.DeviceInfo) {
 					t.Helper()
-					if len(devs[0].CustomInfo) != 0 {
-						t.Fatalf("expected no CustomInfo for non-Ascend910 device, got %v", devs[0].CustomInfo)
+					ci := devs[0].CustomInfo
+					if len(ci) != 2 {
+						t.Fatalf("expected CustomInfo to contain only CardID/DeviceID, got %v", ci)
+					}
+					if int(ci["CardID"].(float64)) != 0 {
+						t.Fatalf("CardID = %v, want 0", ci["CardID"])
+					}
+					if int(ci["DeviceID"].(float64)) != 0 {
+						t.Fatalf("DeviceID = %v, want 0", ci["DeviceID"])
+					}
+					if _, ok := ci["SlotID"]; ok {
+						t.Fatal("SlotID should be omitted when zero")
+					}
+					if _, ok := ci["PCIeBus"]; ok {
+						t.Fatal("PCIeBus should be omitted when empty")
+					}
+				},
+			},
+		},
+		{
+			name: "Ascend310P_SlotInfo_Full",
+			args: registerHAMiArgs{
+				nodeName:      "test-node",
+				registerAnno:  "hami.io/node-register-Ascend310P",
+				handshakeAnno: "hami.io/node-handshake-Ascend310P",
+				mgr: &FakeManager{
+					GetDevicesFunc: func() []*manager.Device {
+						return []*manager.Device{
+							{UUID: "uuid1", Memory: 43008, AICore: 8, Health: true, CardID: 1, DeviceID: 0, SlotID: 3, PCIeBus: "0000:C1:00.0"},
+						}
+					},
+					VDeviceCountFunc:   func() int { return 7 },
+					CommonWordFunc:     func() string { return "Ascend310P" },
+					IsHamiVnpuCoreFunc: func() bool { return false },
+				},
+				nodes: []*v1.Node{
+					{ObjectMeta: metav1.ObjectMeta{Name: "test-node", Annotations: map[string]string{}}},
+				},
+			},
+			want: registerHAMiWant{
+				deviceCount: 1,
+				deviceCheck: func(t *testing.T, devs []*device.DeviceInfo) {
+					t.Helper()
+					ci := devs[0].CustomInfo
+					if len(ci) != 4 {
+						t.Fatalf("expected CustomInfo with 4 slot fields, got %v", ci)
+					}
+					if int(ci["CardID"].(float64)) != 1 {
+						t.Fatalf("CardID = %v, want 1", ci["CardID"])
+					}
+					if int(ci["DeviceID"].(float64)) != 0 {
+						t.Fatalf("DeviceID = %v, want 0", ci["DeviceID"])
+					}
+					if int(ci["SlotID"].(float64)) != 3 {
+						t.Fatalf("SlotID = %v, want 3", ci["SlotID"])
+					}
+					if ci["PCIeBus"].(string) != "0000:C1:00.0" {
+						t.Fatalf("PCIeBus = %v, want 0000:C1:00.0", ci["PCIeBus"])
+					}
+				},
+			},
+		},
+		{
+			name: "NetworkID_Coexists_WithSlotInfo",
+			args: registerHAMiArgs{
+				nodeName:      "test-node",
+				registerAnno:  "hami.io/node-register-Ascend910B",
+				handshakeAnno: "hami.io/node-handshake-Ascend910B",
+				mgr: &FakeManager{
+					GetDevicesFunc: func() []*manager.Device {
+						return []*manager.Device{
+							{UUID: "uuid1", Memory: 32768, AICore: 30, Health: true, CardID: 2, DeviceID: 1, SlotID: 5, PCIeBus: "0000:81:00.0"},
+						}
+					},
+					VDeviceCountFunc:   func() int { return 1 },
+					CommonWordFunc:     func() string { return "Ascend910B" },
+					IsHamiVnpuCoreFunc: func() bool { return false },
+				},
+				nodes: []*v1.Node{
+					{ObjectMeta: metav1.ObjectMeta{Name: "test-node", Annotations: map[string]string{}}},
+				},
+			},
+			want: registerHAMiWant{
+				deviceCount: 1,
+				deviceCheck: func(t *testing.T, devs []*device.DeviceInfo) {
+					t.Helper()
+					ci := devs[0].CustomInfo
+					if _, ok := ci["NetworkID"]; !ok {
+						t.Fatal("expected NetworkID to remain for Ascend910B device")
+					}
+					if int(ci["SlotID"].(float64)) != 5 {
+						t.Fatalf("SlotID = %v, want 5", ci["SlotID"])
+					}
+					if ci["PCIeBus"].(string) != "0000:81:00.0" {
+						t.Fatalf("PCIeBus = %v, want 0000:81:00.0", ci["PCIeBus"])
+					}
+					if int(ci["CardID"].(float64)) != 2 {
+						t.Fatalf("CardID = %v, want 2", ci["CardID"])
 					}
 				},
 			},

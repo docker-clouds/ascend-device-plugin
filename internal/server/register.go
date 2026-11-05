@@ -76,24 +76,33 @@ func (ps *PluginServer) registerHAMi() error {
 		if ps.mgr.IsHamiVnpuCore() {
 			devcore = HamiVnpuCoreMaxPercent
 		}
+		customInfo := map[string]any{
+			"CardID":   dev.CardID,
+			"DeviceID": dev.DeviceID,
+		}
+		if dev.SlotID > 0 {
+			customInfo["SlotID"] = dev.SlotID
+		}
+		if dev.PCIeBus != "" {
+			customInfo["PCIeBus"] = dev.PCIeBus
+		}
 		device := &device.DeviceInfo{
-			Index:   uint(i),
-			ID:      dev.UUID,
-			Count:   int32(ps.mgr.VDeviceCount()),
-			Devmem:  int32(dev.Memory),
-			Devcore: devcore,
-			Type:    ps.mgr.CommonWord(),
-			Numa:    0,
-			Health:  dev.Health,
+			Index:      uint(i),
+			ID:         dev.UUID,
+			Count:      int32(ps.mgr.VDeviceCount()),
+			Devmem:     int32(dev.Memory),
+			Devcore:    devcore,
+			Type:       ps.mgr.CommonWord(),
+			Numa:       0,
+			Health:     dev.Health,
+			CustomInfo: customInfo,
 		}
 		if strings.HasPrefix(device.Type, Ascend910Prefix) {
 			networkID, err := ps.getDeviceNetworkID(i, device.Type)
 			if err != nil {
 				return fmt.Errorf("get networkID error: %w", err)
 			}
-			device.CustomInfo = map[string]any{
-				"NetworkID": networkID,
-			}
+			customInfo["NetworkID"] = networkID
 		}
 		apiDevices = append(apiDevices, device)
 	}

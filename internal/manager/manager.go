@@ -38,6 +38,8 @@ type Device struct {
 	Memory   int64
 	AICore   int32
 	Health   bool
+	SlotID   uint32
+	PCIeBus  string
 }
 
 // Manager defines the interface that PluginServer depends on.
@@ -205,6 +207,7 @@ func (am *AscendManager) UpdateDevice() error {
 			klog.Errorf("failed to get device health: %v", err)
 			return err
 		}
+		slotID, pcieBus := am.getSlotInfo(ID)
 		newDevs = append(newDevs, &Device{
 			UUID:     uuid,
 			LogicID:  ID,
@@ -214,12 +217,36 @@ func (am *AscendManager) UpdateDevice() error {
 			Memory:   am.config.MemoryAllocatable,
 			AICore:   am.config.AICore,
 			Health:   health == 0,
+			SlotID:   slotID,
+			PCIeBus:  pcieBus,
 		})
 	}
 	am.mu.Lock()
 	am.devs = newDevs
 	am.mu.Unlock()
 	return nil
+}
+
+// getSlotInfo collects auxiliary slot metadata for the given device on a
+// best-effort basis: not every product/driver supports board or PCIe queries,
+// so failures are logged and reported as zero values instead of failing the
+// whole device refresh.
+func (am *AscendManager) getSlotInfo(logicID int32) (uint32, string) {
+	var slotID uint32
+	var pcieBus string
+	board, err := am.mgr.GetBoardInfo(logicID)
+	if err != nil {
+		klog.Warningf("failed to get board info for logic ID %d: %v", logicID, err)
+	} else {
+		slotID = board.SlotId
+	}
+	bus, err := am.mgr.GetPCIeBusInfo(logicID)
+	if err != nil {
+		klog.Warningf("failed to get PCIe bus info for logic ID %d: %v", logicID, err)
+	} else {
+		pcieBus = bus
+	}
+	return slotID, pcieBus
 }
 
 func (am *AscendManager) GetDevices() []*Device {
