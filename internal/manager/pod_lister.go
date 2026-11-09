@@ -123,10 +123,12 @@ func (pl *PodLister) IsSynced() bool {
 // "huawei.com/Ascend910C") and deviceByUUID resolves a device UUID to its
 // Device so the logicID can be obtained.
 //
-// Pods in a terminal phase (Succeeded/Failed) and non-terminal pods whose
-// containers are all crash-looping or terminated (zombies of failed
-// workloads) do not contribute keys, so their idle vnpus stay eligible for
-// cleanup.
+// Pods in a terminal phase (Succeeded/Failed), pods on an unreachable node
+// (Unknown — the kubelet-written container snapshot can no longer be trusted,
+// the local hardware query IsContainerUsed stays authoritative), and
+// non-terminal pods whose containers are all crash-looping, terminated, or in
+// an undeterminable state (zombies of failed workloads) do not contribute
+// keys, so their idle vnpus stay eligible for cleanup.
 func (pl *PodLister) ActiveVnpuKeys(annoKey string, deviceByUUID func(string) *Device) map[VnpuKey][]string {
 	pods, err := pl.podLister.List(labels.Everything())
 	if err != nil {
@@ -136,11 +138,18 @@ func (pl *PodLister) ActiveVnpuKeys(annoKey string, deviceByUUID func(string) *D
 
 	active := make(map[VnpuKey][]string)
 	for _, pod := range pods {
-		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+		switch pod.Status.Phase {
+		case corev1.PodSucceeded, corev1.PodFailed:
+			continue
+		case corev1.PodUnknown:
+			// Node-outage pods can persist for the whole outage, so this logs
+			// at V(1) to avoid spamming every cleanup cycle.
+			klog.V(1).Infof("PodLister: pod %s/%s is on an unreachable node (phase Unknown); treating as zombie, not protecting slots (hardware query stays authoritative)",
+				pod.Namespace, pod.Name)
 			continue
 		}
 		if !podActivelyUsesVnpu(pod) {
-			klog.Infof("PodLister: pod %s/%s holds vnpu annotation but all containers are in CrashLoopBackOff/terminated state; treating as zombie, not protecting slots",
+			klog.Infof("PodLister: pod %s/%s holds vnpu annotation but all containers are in CrashLoopBackOff/terminated/undetermined state; treating as zombie, not protecting slots",
 				pod.Namespace, pod.Name)
 			continue
 		}
@@ -178,12 +187,20 @@ func (pl *PodLister) ActiveVnpuKeys(annoKey string, deviceByUUID func(string) *D
 // claimed vnpus and therefore needs its slots protected from idle cleanup.
 //
 // Protective: any container Running, waiting in a non-backoff phase
-// (ContainerCreating/PodInitializing/ImagePullBackOff/...), or no container
-// status yet (freshly scheduled pod, allocation-to-start race window).
+// (ContainerCreating/PodInitializing/ImagePullBackOff/...), no container
+// status yet (freshly scheduled pod, allocation-to-start race window), or a
+// state-less container entry on a Pending pod (normal pre-start window).
 // Not protective: every container is either Waiting with reason
-// CrashLoopBackOff (kubelet backoff after repeated crashes) or Terminated
-// awaiting restart — the pod is a zombie whose containers get vnpus
-// re-created on demand if they ever start again.
+// CrashLoopBackOff (kubelet backoff after repeated crashes), Terminated
+// awaiting restart, or has an undeterminable state (all of Running/Waiting/
+// Terminated nil — kubelet could not report container state, e.g. runtime
+// wedged) on a non-Pending pod — the pod is a zombie whose containers get
+// vnpus re-created on demand if they ever start again.
+//
+// Safety: this pod-level check is only a secondary protection layer on top of
+// the primary hardware gate (IsContainerUsed == 0 in CleanupIdleVNPUs) — a
+// container that genuinely holds its vnpu keeps the slot alive regardless of
+// this classification.
 func podActivelyUsesVnpu(pod *corev1.Pod) bool {
 	statuses := make([]corev1.ContainerStatus, 0,
 		len(pod.Status.InitContainerStatuses)+len(pod.Status.ContainerStatuses))
@@ -200,8 +217,19 @@ func podActivelyUsesVnpu(pod *corev1.Pod) bool {
 			continue
 		case cs.State.Waiting != nil && cs.State.Waiting.Reason == "CrashLoopBackOff":
 			continue
-		default:
+		case cs.State.Waiting != nil:
+			// Waiting with a non-backoff reason (ContainerCreating,
+			// PodInitializing, ImagePullBackOff, ...): startup or self-healing.
 			return true
+		default:
+			// Undeterminable state (all three states nil): for a Pending pod
+			// this is the normal pre-start window — protective. Otherwise the
+			// container existed before and its state was lost — treat as
+			// zombie; the hardware query remains the authoritative gate.
+			if pod.Status.Phase == corev1.PodPending {
+				return true
+			}
+			continue
 		}
 	}
 	return false
