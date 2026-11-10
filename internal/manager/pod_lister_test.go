@@ -279,6 +279,12 @@ func terminatedStatus() corev1.ContainerStatus {
 	}
 }
 
+// unknownStatus builds a ContainerStatus whose state kubelet could not
+// determine (all of Running/Waiting/Terminated nil).
+func unknownStatus() corev1.ContainerStatus {
+	return corev1.ContainerStatus{Name: "main"}
+}
+
 func TestActiveVnpuKeys_CrashLoopPodExcluded(t *testing.T) {
 	devs := []*Device{{UUID: "uuid-0", LogicID: 0}}
 	fakeClient := fake.NewSimpleClientset(
@@ -392,5 +398,129 @@ func TestActiveVnpuKeys_PendingNoStatusesProtected(t *testing.T) {
 	active := pl.ActiveVnpuKeys(testAnnoKey, makeDeviceByUUID(devs))
 	if _, ok := active[VnpuKey{LogicID: 0, Template: "vir01"}]; !ok {
 		t.Errorf("expected key {0, vir01} for freshly scheduled pod without container statuses, got %v", active)
+	}
+}
+
+// TestPodActivelyUsesVnpu directly covers the pure classification function;
+// the ActiveVnpuKeys tests above cover it indirectly through the full pipeline.
+func TestPodActivelyUsesVnpu(t *testing.T) {
+	tests := []struct {
+		name     string
+		phase    corev1.PodPhase
+		init     bool // place statuses on init containers instead of regular ones
+		statuses []corev1.ContainerStatus
+		want     bool
+	}{
+		{name: "no statuses (fresh pod race window)", phase: corev1.PodRunning, want: true},
+		{name: "running", phase: corev1.PodRunning, statuses: []corev1.ContainerStatus{runningStatus()}, want: true},
+		{name: "all terminated", phase: corev1.PodRunning, statuses: []corev1.ContainerStatus{terminatedStatus()}, want: false},
+		{name: "all crashloop", phase: corev1.PodRunning, statuses: []corev1.ContainerStatus{waitingStatus("CrashLoopBackOff")}, want: false},
+		{name: "container creating", phase: corev1.PodRunning, statuses: []corev1.ContainerStatus{waitingStatus("ContainerCreating")}, want: true},
+		{name: "waiting with empty reason", phase: corev1.PodRunning, statuses: []corev1.ContainerStatus{waitingStatus("")}, want: true},
+		{name: "undetermined on pending pod (pre-start)", phase: corev1.PodPending, statuses: []corev1.ContainerStatus{unknownStatus()}, want: true},
+		{name: "undetermined on running pod (status lost)", phase: corev1.PodRunning, statuses: []corev1.ContainerStatus{unknownStatus()}, want: false},
+		{name: "undetermined init container on running pod", phase: corev1.PodRunning, init: true, statuses: []corev1.ContainerStatus{unknownStatus()}, want: false},
+		{name: "undetermined + terminated", phase: corev1.PodRunning, statuses: []corev1.ContainerStatus{unknownStatus(), terminatedStatus()}, want: false},
+		{name: "undetermined + running sidecar", phase: corev1.PodRunning, statuses: []corev1.ContainerStatus{unknownStatus(), runningStatus()}, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pod := &corev1.Pod{Status: corev1.PodStatus{Phase: tt.phase}}
+			if tt.init {
+				pod.Status.InitContainerStatuses = tt.statuses
+			} else {
+				pod.Status.ContainerStatuses = tt.statuses
+			}
+			if got := podActivelyUsesVnpu(pod); got != tt.want {
+				t.Errorf("podActivelyUsesVnpu() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestActiveVnpuKeys_UnknownStateRunningPodExcluded pins the field scenario:
+// a non-Pending pod whose container state is undeterminable (all states nil,
+// the API form of containerStatusUnknown) must not protect its vnpu slots.
+func TestActiveVnpuKeys_UnknownStateRunningPodExcluded(t *testing.T) {
+	devs := []*Device{{UUID: "uuid-0", LogicID: 0}}
+	fakeClient := fake.NewSimpleClientset(
+		makeStatusfulPod("pod-status-lost", corev1.PodRunning,
+			[]corev1.ContainerStatus{unknownStatus()}),
+	)
+
+	pl, err := newPodLister("node1", fakeClient)
+	if err != nil {
+		t.Fatalf("newPodLister: %v", err)
+	}
+	defer pl.Stop()
+
+	active := pl.ActiveVnpuKeys(testAnnoKey, makeDeviceByUUID(devs))
+	if len(active) != 0 {
+		t.Errorf("expected no active keys for pod with undeterminable container state, got %v", active)
+	}
+}
+
+// TestActiveVnpuKeys_UnknownStatePendingPodProtected keeps the pre-start
+// window protective: a state-less container entry on a Pending pod is normal
+// (container not yet created), not a lost status.
+func TestActiveVnpuKeys_UnknownStatePendingPodProtected(t *testing.T) {
+	devs := []*Device{{UUID: "uuid-0", LogicID: 0}}
+	fakeClient := fake.NewSimpleClientset(
+		makeStatusfulPod("pod-prestart", corev1.PodPending,
+			[]corev1.ContainerStatus{unknownStatus()}),
+	)
+
+	pl, err := newPodLister("node1", fakeClient)
+	if err != nil {
+		t.Fatalf("newPodLister: %v", err)
+	}
+	defer pl.Stop()
+
+	active := pl.ActiveVnpuKeys(testAnnoKey, makeDeviceByUUID(devs))
+	if _, ok := active[VnpuKey{LogicID: 0, Template: "vir01"}]; !ok {
+		t.Errorf("expected key {0, vir01} for Pending pod in pre-start window, got %v", active)
+	}
+}
+
+// TestActiveVnpuKeys_UnknownPhasePodExcluded: a pod on an unreachable node
+// (phase Unknown) is skipped at the phase level even when its stale container
+// snapshot still shows Running — the hardware query stays authoritative.
+func TestActiveVnpuKeys_UnknownPhasePodExcluded(t *testing.T) {
+	devs := []*Device{{UUID: "uuid-0", LogicID: 0}}
+	fakeClient := fake.NewSimpleClientset(
+		makeStatusfulPod("pod-node-lost", corev1.PodUnknown,
+			[]corev1.ContainerStatus{runningStatus()}),
+	)
+
+	pl, err := newPodLister("node1", fakeClient)
+	if err != nil {
+		t.Fatalf("newPodLister: %v", err)
+	}
+	defer pl.Stop()
+
+	active := pl.ActiveVnpuKeys(testAnnoKey, makeDeviceByUUID(devs))
+	if len(active) != 0 {
+		t.Errorf("expected no active keys for phase-Unknown pod, got %v", active)
+	}
+}
+
+// TestActiveVnpuKeys_MixedUnknownAndRunningProtected: a pod with one
+// undeterminable container but another still Running stays protective.
+func TestActiveVnpuKeys_MixedUnknownAndRunningProtected(t *testing.T) {
+	devs := []*Device{{UUID: "uuid-0", LogicID: 0}}
+	fakeClient := fake.NewSimpleClientset(
+		makeStatusfulPod("pod-sidecar-running", corev1.PodRunning,
+			[]corev1.ContainerStatus{unknownStatus(), runningStatus()}),
+	)
+
+	pl, err := newPodLister("node1", fakeClient)
+	if err != nil {
+		t.Fatalf("newPodLister: %v", err)
+	}
+	defer pl.Stop()
+
+	active := pl.ActiveVnpuKeys(testAnnoKey, makeDeviceByUUID(devs))
+	if _, ok := active[VnpuKey{LogicID: 0, Template: "vir01"}]; !ok {
+		t.Errorf("expected key {0, vir01} for pod with a running sidecar, got %v", active)
 	}
 }
